@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import traceback
+import os
 
 app = Flask(__name__)
 CORS(app)
@@ -193,5 +194,6 @@ def health():
 
 
 if __name__ == "__main__":
-    print("Starting EPS Dashboard Backend on http://localhost:5001")
-    app.run(debug=True, port=5001)
+    port = int(os.environ.get("PORT", 8080))
+    print(f"Starting EPS Dashboard Backend on http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port)
