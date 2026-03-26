@@ -8,12 +8,21 @@ from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import traceback
 import os
+import requests
 
 app = Flask(__name__)
 CORS(app)
+
+# Fix for cloud server IP blocks by Yahoo Finance
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+})
 
 
 def safe_float(val, default=None):
@@ -30,7 +39,7 @@ def get_eps_trend_data(ticker: str):
     Fetches eps_trend, eps_revisions, earnings_estimate from yfinance.
     Returns a structured dict matching the book's table format.
     """
-    t = yf.Ticker(ticker)
+    t = yf.Ticker(ticker, session=session)
     info = t.info
 
     result = {
@@ -95,15 +104,11 @@ def get_eps_trend_data(ticker: str):
     return result
 
 
-def build_revision_table(eps_trend_dict):
+def build_revision_table(eps_trend_dict, earnings_estimate=None):
     """
-    Converts yfinance eps_trend into a clean revision table matching the book.
-    Columns: 0q (This Quarter), +1q (Next Quarter), 0y (This Year), +1y (Next Year)
-    Rows: current, 7daysAgo, 30daysAgo, 60daysAgo, 90daysAgo
+    Build revision table from eps_trend if available,
+    otherwise fall back to earnings_estimate for Current row.
     """
-    if not eps_trend_dict:
-        return None
-
     period_map = {
         "0q": "This Quarter",
         "+1q": "Next Quarter",
@@ -119,16 +124,24 @@ def build_revision_table(eps_trend_dict):
         "90daysAgo": "90 Days Ago"
     }
 
-    table = {}
-    for row_key, row_label in row_map.items():
-        row_data = {}
+    # Initialize all cells to None
+    table = {label: {p: None for p in period_map.values()} for label in row_map.values()}
+
+    # Try eps_trend first (gives all 5 rows)
+    if eps_trend_dict:
+        for row_key, row_label in row_map.items():
+            for period_key, period_label in period_map.items():
+                try:
+                    val = eps_trend_dict.get(period_key, {}).get(row_key)
+                    table[row_label][period_label] = safe_float(val)
+                except:
+                    pass
+
+    # Fall back to earnings_estimate for Current row if eps_trend unavailable
+    if earnings_estimate and all(v is None for v in table["Current"].values()):
+        avg = earnings_estimate.get("avg", {})
         for period_key, period_label in period_map.items():
-            try:
-                val = eps_trend_dict.get(period_key, {}).get(row_key)
-                row_data[period_label] = safe_float(val)
-            except:
-                row_data[period_label] = None
-        table[row_label] = row_data
+            table["Current"][period_label] = safe_float(avg.get(period_key))
 
     return table
 
@@ -160,7 +173,10 @@ def compute_revision_pct(table):
 def get_eps(ticker):
     try:
         data = get_eps_trend_data(ticker.upper())
-        revision_table = build_revision_table(data.get("eps_trend_table"))
+        revision_table = build_revision_table(
+            data.get("eps_trend_table"),
+            data.get("earnings_estimate_table")
+        )
         revision_pct = compute_revision_pct(revision_table)
 
         return jsonify({
@@ -191,6 +207,17 @@ def get_eps(ticker):
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "time": datetime.now().isoformat()})
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "message": "EPS Earnings Estimate Tracker API",
+        "endpoints": {
+            "health": "/api/health",
+            "eps_data": "/api/eps/<ticker>  e.g. /api/eps/AAPL"
+        }
+    })
 
 
 if __name__ == "__main__":
