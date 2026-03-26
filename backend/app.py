@@ -1,0 +1,197 @@
+"""
+EPS Consensus Earnings Trend Dashboard - Backend
+Fetches analyst estimate data from Yahoo Finance via yfinance
+"""
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import traceback
+
+app = Flask(__name__)
+CORS(app)
+
+
+def safe_float(val, default=None):
+    try:
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return default
+        return round(float(val), 4)
+    except:
+        return default
+
+
+def get_eps_trend_data(ticker: str):
+    """
+    Fetches eps_trend, eps_revisions, earnings_estimate from yfinance.
+    Returns a structured dict matching the book's table format.
+    """
+    t = yf.Ticker(ticker)
+    info = t.info
+
+    result = {
+        "ticker": ticker.upper(),
+        "company_name": info.get("longName", ticker.upper()),
+        "currency": info.get("currency", "USD"),
+        "current_price": safe_float(info.get("currentPrice") or info.get("regularMarketPrice")),
+        "market_cap": info.get("marketCap"),
+        "sector": info.get("sector", "N/A"),
+        "eps_trend_table": None,
+        "eps_revisions_table": None,
+        "earnings_estimate_table": None,
+        "earnings_history": None,
+        "upgrades_downgrades": None,
+        "errors": []
+    }
+
+    # --- EPS Trend (the main table from the book) ---
+    try:
+        eps_trend = t.eps_trend
+        if eps_trend is not None and not eps_trend.empty:
+            result["eps_trend_table"] = eps_trend.to_dict()
+    except Exception as e:
+        result["errors"].append(f"eps_trend: {str(e)}")
+
+    # --- EPS Revisions ---
+    try:
+        eps_rev = t.eps_revisions
+        if eps_rev is not None and not eps_rev.empty:
+            result["eps_revisions_table"] = eps_rev.to_dict()
+    except Exception as e:
+        result["errors"].append(f"eps_revisions: {str(e)}")
+
+    # --- Earnings Estimate ---
+    try:
+        ee = t.earnings_estimate
+        if ee is not None and not ee.empty:
+            result["earnings_estimate_table"] = ee.to_dict()
+    except Exception as e:
+        result["errors"].append(f"earnings_estimate: {str(e)}")
+
+    # --- Earnings History (actual vs estimate) ---
+    try:
+        eh = t.earnings_history
+        if eh is not None and not eh.empty:
+            eh_recent = eh.tail(8).copy()
+            eh_recent.index = eh_recent.index.astype(str)
+            result["earnings_history"] = eh_recent.to_dict(orient="index")
+    except Exception as e:
+        result["errors"].append(f"earnings_history: {str(e)}")
+
+    # --- Upgrades/Downgrades (recent 30) ---
+    try:
+        ud = t.upgrades_downgrades
+        if ud is not None and not ud.empty:
+            ud_recent = ud.head(30).copy()
+            ud_recent.index = ud_recent.index.astype(str)
+            result["upgrades_downgrades"] = ud_recent.to_dict(orient="index")
+    except Exception as e:
+        result["errors"].append(f"upgrades_downgrades: {str(e)}")
+
+    return result
+
+
+def build_revision_table(eps_trend_dict):
+    """
+    Converts yfinance eps_trend into a clean revision table matching the book.
+    Columns: 0q (This Quarter), +1q (Next Quarter), 0y (This Year), +1y (Next Year)
+    Rows: current, 7daysAgo, 30daysAgo, 60daysAgo, 90daysAgo
+    """
+    if not eps_trend_dict:
+        return None
+
+    period_map = {
+        "0q": "This Quarter",
+        "+1q": "Next Quarter",
+        "0y": "This Year",
+        "+1y": "Next Year"
+    }
+
+    row_map = {
+        "current": "Current",
+        "7daysAgo": "7 Days Ago",
+        "30daysAgo": "30 Days Ago",
+        "60daysAgo": "60 Days Ago",
+        "90daysAgo": "90 Days Ago"
+    }
+
+    table = {}
+    for row_key, row_label in row_map.items():
+        row_data = {}
+        for period_key, period_label in period_map.items():
+            try:
+                val = eps_trend_dict.get(period_key, {}).get(row_key)
+                row_data[period_label] = safe_float(val)
+            except:
+                row_data[period_label] = None
+        table[row_label] = row_data
+
+    return table
+
+
+def compute_revision_pct(table):
+    """
+    Compute % revision from 30 days ago to current for each period.
+    """
+    if not table:
+        return {}
+
+    revisions = {}
+    current = table.get("Current", {})
+    thirty = table.get("30 Days Ago", {})
+
+    for period in ["This Quarter", "Next Quarter", "This Year", "Next Year"]:
+        cur = current.get(period)
+        old = thirty.get(period)
+        if cur is not None and old is not None and old != 0:
+            pct = ((cur - old) / abs(old)) * 100
+            revisions[period] = round(pct, 2)
+        else:
+            revisions[period] = None
+
+    return revisions
+
+
+@app.route("/api/eps/<ticker>", methods=["GET"])
+def get_eps(ticker):
+    try:
+        data = get_eps_trend_data(ticker.upper())
+        revision_table = build_revision_table(data.get("eps_trend_table"))
+        revision_pct = compute_revision_pct(revision_table)
+
+        return jsonify({
+            "success": True,
+            "ticker": data["ticker"],
+            "company_name": data["company_name"],
+            "currency": data["currency"],
+            "current_price": data["current_price"],
+            "market_cap": data["market_cap"],
+            "sector": data["sector"],
+            "revision_table": revision_table,
+            "revision_pct": revision_pct,
+            "eps_revisions_table": data.get("eps_revisions_table"),
+            "earnings_estimate_table": data.get("earnings_estimate_table"),
+            "earnings_history": data.get("earnings_history"),
+            "upgrades_downgrades": data.get("upgrades_downgrades"),
+            "errors": data["errors"],
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "trace": traceback.format_exc()
+        }), 500
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "time": datetime.now().isoformat()})
+
+
+if __name__ == "__main__":
+    print("Starting EPS Dashboard Backend on http://localhost:5001")
+    app.run(debug=True, port=5001)
